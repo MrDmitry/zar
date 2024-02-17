@@ -1,103 +1,88 @@
 const std = @import("std");
-const c = @cImport({
-    @cInclude("pulse/pulseaudio.h");
-});
+const PulseAudio = @import("pulseaudio/Context.zig");
+const Config = @import("Config.zig");
 
-const PulseError = error{
-    GeneralError,
-    ContextError,
+const Args = enum {
+    @"-h",
+    @"--help",
+    @"-c",
+    @"-d",
 };
 
-const pa_log = std.log.scoped(.pulse);
-
-const PulseContext = struct {
-    const Self = @This();
-
-    mainloop: *c.pa_threaded_mainloop,
-    mainloop_api: *c.pa_mainloop_api,
-    context: *c.pa_context,
-
-    fn init() Self {
-        const mainloop = c.pa_threaded_mainloop_new().?;
-        errdefer c.pa_threaded_mainloop_new(mainloop);
-
-        c.pa_threaded_mainloop_set_name(mainloop, "zar_pa");
-
-        const api = c.pa_threaded_mainloop_get_api(mainloop);
-
-        const ctx = c.pa_context_new(api, "ZenAudioRouter").?;
-        errdefer {
-            c.pa_context_unref(ctx);
-        }
-
-        return Self{
-            .mainloop = mainloop,
-            .mainloop_api = api,
-            .context = ctx,
-        };
-    }
-
-    fn deinit(self: *Self) void {
-        c.pa_context_disconnect(self.context);
-        c.pa_context_unref(self.context);
-        c.pa_threaded_mainloop_stop(self.mainloop);
-        c.pa_threaded_mainloop_free(self.mainloop);
-    }
-
-    fn contextCallback(ctx: ?*c.pa_context, data: ?*anyopaque) callconv(.C) void {
-        const self: *Self = @ptrCast(@alignCast(data.?));
-        std.debug.assert(ctx.? == self.context);
-
-        switch (c.pa_context_get_state(self.context)) {
-            c.PA_CONTEXT_READY => {
-                pa_log.debug("pulse context ready", .{});
-            },
-            c.PA_CONTEXT_FAILED, c.PA_CONTEXT_TERMINATED => {
-                pa_log.debug("pulse context terminated", .{});
-            },
-            else => |state| {
-                pa_log.debug("pulse context changed: {any}", .{state});
-            },
-        }
-    }
-
-    fn start(self: *Self) !void {
-        c.pa_context_set_state_callback(
-            self.context,
-            &contextCallback,
-            @ptrCast(self),
-        );
-
-        if (c.pa_context_connect(self.context, null, 0, null) != 0) {
-            pa_log.warn("failed to connect context to pulse server", .{});
-            return PulseError.ContextError;
-        }
-        errdefer c.pa_context_disconnect(self.context);
-
-        pa_log.debug("starting pulse", .{});
-        if (c.pa_threaded_mainloop_start(self.mainloop) != 0) {
-            pa_log.warn("failed to start pulse", .{});
-            return PulseError.GeneralError;
-        }
-    }
-
-    fn stop(self: *Self) void {
-        pa_log.debug("stopping pulse", .{});
-        c.pa_threaded_mainloop_stop(self.mainloop);
-    }
+const ArgsDefaults = struct {
+    const @"-c": []const u8 = "/etc/zar";
+    const @"-d": bool = false;
 };
+
+pub fn printHelp() noreturn {
+    std.debug.print(
+        \\Zen Audio Router
+        \\
+        \\usage: zar [-c dir] [-d] [-h/--help]
+        \\
+        \\arguments:
+        \\  -c          dir : path to the zar configuration directory (default: {s})
+        \\  -d              : start as a daemon (default: {})
+        \\  -h/--help       : display this help and exit
+        \\
+    , .{
+        ArgsDefaults.@"-c",
+        ArgsDefaults.@"-d",
+    });
+    std.process.exit(1);
+}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer std.debug.assert(gpa.deinit() == .ok);
 
-    var pulse = PulseContext.init();
+    var args = try std.process.ArgIterator.initWithAllocator(gpa.allocator());
+    defer args.deinit();
+
+    _ = args.skip(); // executable name
+
+    var config_dir: ?std.fs.Dir = null;
+
+    while (args.next()) |it| {
+        const key = std.meta.stringToEnum(Args, it) orelse {
+            std.log.err("unexpected argument: {s}\n", .{it});
+            printHelp();
+        };
+
+        switch (key) {
+            .@"-h", .@"--help" => printHelp(),
+            .@"-c" => {
+                const value = args.next() orelse {
+                    std.log.err("missing value for {s}\n", .{it});
+                    printHelp();
+                };
+                config_dir = try std.fs.cwd().openDir(value, .{});
+
+                std.log.debug("key: {s}; value: {s}", .{ it, value });
+            },
+            else => unreachable,
+        }
+    }
+
+    var config_arena = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer config_arena.deinit();
+
+    const config = try Config.init(config_arena.allocator(), config_dir orelse try std.fs.openDirAbsolute(ArgsDefaults.@"-c", .{}));
+    //try config.write(config_dir.?);
+    std.log.debug("config: {any}", .{config});
+
+    var pulse = PulseAudio.Context.init(gpa.allocator());
     defer pulse.deinit();
 
     try pulse.start();
 
+    if (config.outputs.?.len > 0) {
+        try pulse.server.setDefaultSink(config.outputs.?[0].device.real);
+    }
+
     var buf: [128]u8 = undefined;
-    _ = try std.io.getStdIn().reader().readUntilDelimiterOrEof(buf[0..], '\n');
+    var fbs = std.io.fixedBufferStream(&buf);
+    _ = try std.io.getStdIn().reader().streamUntilDelimiter(fbs.writer(), '\n', null);
     std.log.debug("input: {s}", .{buf});
 
     pulse.stop();
