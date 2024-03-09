@@ -2,10 +2,14 @@ const std = @import("std");
 const c = @cImport({
     @cInclude("pulse/pulseaudio.h");
 });
-const Server = @import("Server.zig");
+const Channel = @import("Channel.zig");
 const Client = @import("Client.zig");
+const Config = @import("../Config.zig");
+const Server = @import("Server.zig");
 const Sink = @import("Sink.zig");
 const SinkInput = @import("SinkInput.zig");
+const Source = @import("Source.zig");
+const SourceOutput = @import("SourceOutput.zig");
 
 const PulseError = error{
     GeneralError,
@@ -59,8 +63,28 @@ const Event = struct {
     }
 };
 
+const RemapModuleType = enum {
+    sink,
+    source,
+};
+
+const LoadModulePayload = struct {
+    const Self = @This();
+
+    allocator: std.mem.Allocator,
+
+    context: *Context,
+    args: [:0]const u8,
+
+    pub fn deinit(self: *Self) void {
+        self.allocator.free(self.args);
+    }
+};
+
 pub const Context = struct {
     const Self = @This();
+
+    allocator: std.mem.Allocator,
 
     mainloop: *c.pa_threaded_mainloop,
     mainloop_api: *c.pa_mainloop_api,
@@ -70,6 +94,8 @@ pub const Context = struct {
     client: Client,
     sink: Sink,
     sink_input: SinkInput,
+    source: Source,
+    source_output: SourceOutput,
     mutex: std.Thread.Mutex = .{},
     cv: std.Thread.Condition = .{},
     ready: bool = false,
@@ -88,6 +114,7 @@ pub const Context = struct {
         }
 
         return Self{
+            .allocator = allocator,
             .mainloop = mainloop,
             .mainloop_api = api,
             .context = ctx,
@@ -95,10 +122,14 @@ pub const Context = struct {
             .client = Client.init(allocator, mainloop, ctx),
             .sink = Sink.init(allocator, mainloop, ctx),
             .sink_input = SinkInput.init(allocator, mainloop, ctx),
+            .source = Source.init(allocator, mainloop, ctx),
+            .source_output = SourceOutput.init(allocator, mainloop, ctx),
         };
     }
 
     pub fn deinit(self: *Self) void {
+        self.source_output.deinit();
+        self.source.deinit();
         self.sink_input.deinit();
         self.sink.deinit();
         self.client.deinit();
@@ -133,7 +164,17 @@ pub const Context = struct {
                     EventType.INVALID => unreachable,
                 }
             },
-            EventFacility.SOURCE => {},
+            EventFacility.SOURCE => {
+                switch (event.type) {
+                    EventType.REMOVE => {
+                        self.source.collection.removeItem(id);
+                    },
+                    EventType.NEW, EventType.CHANGE => {
+                        self.source.collection.updateItem(id);
+                    },
+                    EventType.INVALID => unreachable,
+                }
+            },
             EventFacility.SINK_INPUT => {
                 switch (event.type) {
                     EventType.REMOVE => {
@@ -145,7 +186,17 @@ pub const Context = struct {
                     EventType.INVALID => unreachable,
                 }
             },
-            EventFacility.SOURCE_OUTPUT => {},
+            EventFacility.SOURCE_OUTPUT => {
+                switch (event.type) {
+                    EventType.REMOVE => {
+                        self.source_output.collection.removeItem(id);
+                    },
+                    EventType.NEW, EventType.CHANGE => {
+                        self.source_output.collection.updateItem(id);
+                    },
+                    EventType.INVALID => unreachable,
+                }
+            },
             EventFacility.MODULE => {},
             EventFacility.CLIENT => {
                 switch (event.type) {
@@ -206,6 +257,20 @@ pub const Context = struct {
         }
     }
 
+    fn loadModuleCallback(ctx: ?*c.pa_context, idx: u32, data: ?*anyopaque) callconv(.C) void {
+        const payload: *LoadModulePayload = @ptrCast(@alignCast(data.?));
+        const self: *Self = payload.context;
+        defer {
+            payload.deinit();
+            self.allocator.destroy(payload);
+        }
+
+        std.debug.assert(ctx.? == self.context);
+        pa_log.debug("load module callback: {d} for {s}", .{ idx, payload.args });
+
+        c.pa_threaded_mainloop_signal(self.mainloop, 0);
+    }
+
     pub fn start(self: *Self) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -254,10 +319,149 @@ pub const Context = struct {
         self.client.collection.setup();
         self.sink.collection.setup();
         self.sink_input.collection.setup();
+        self.source.collection.setup();
+        self.source_output.collection.setup();
     }
 
     pub fn stop(self: *Self) void {
         pa_log.debug("stopping pulse", .{});
         c.pa_threaded_mainloop_stop(self.mainloop);
+    }
+
+    pub fn setup(self: *Self, config: Config) !void {
+        if (config.outputs) |outputs| {
+            try self.setupOutputs(outputs);
+        }
+
+        if (config.inputs) |inputs| {
+            try self.setupInputs(inputs);
+        }
+    }
+
+    fn setupOutputs(self: *Self, outputs: []const Config.DeviceType) !void {
+        var defaultSet = false;
+
+        loop: for (outputs) |output| {
+            const name = blk: {
+                switch (output) {
+                    .existing => |u| {
+                        break :blk u;
+                    },
+                    .remap => |m| {
+                        try self.setupRemapModule(.sink, m);
+                        break :blk m.name;
+                    },
+                    .empty => {
+                        continue :loop;
+                    },
+                }
+            };
+
+            if (defaultSet == false) {
+                try self.server.setDefaultSink(name);
+                defaultSet = true;
+            }
+        }
+    }
+
+    fn setupRemapModule(self: *Self, comptime module: RemapModuleType, remap: Config.RemapDevice) !void {
+        var args: [1024]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&args);
+        var writer = fbs.writer();
+        try writer.print(
+            @tagName(module) ++ "_name={s} " ++ @tagName(module) ++ "_properties=device.description=\"{s}\" master={s} channels={d}",
+            .{
+                remap.name,
+                remap.name,
+                remap.existing,
+                remap.channels.remap.len,
+            },
+        );
+
+        try writer.writeAll(" master_channel_map=");
+        for (0.., remap.channels.existing) |i, channel| {
+            if (i > 0) {
+                try writer.writeAll(",");
+            }
+            const position: Channel.Position = @enumFromInt(channel);
+            try writer.writeAll(position.pulseName());
+        }
+
+        try writer.writeAll(" channel_map=");
+        for (0.., remap.channels.remap) |i, channel| {
+            if (i > 0) {
+                try writer.writeAll(",");
+            }
+            const position: Channel.Position = @enumFromInt(channel);
+            try writer.writeAll(position.pulseName());
+        }
+
+        var payload = try self.allocator.create(LoadModulePayload);
+        payload.allocator = self.allocator;
+        payload.context = self;
+        payload.args = try payload.allocator.dupeZ(u8, args[0..fbs.pos]);
+        errdefer {
+            payload.deinit();
+            self.allocator.destroy(payload);
+        }
+
+        const lock_needed = c.pa_threaded_mainloop_in_thread(self.mainloop) == 0;
+        if (lock_needed) {
+            c.pa_threaded_mainloop_lock(self.mainloop);
+        }
+        defer {
+            if (lock_needed) {
+                c.pa_threaded_mainloop_unlock(self.mainloop);
+            }
+        }
+
+        const op = c.pa_context_load_module(
+            self.context,
+            "module-remap-" ++ @tagName(module),
+            payload.args.ptr,
+            &loadModuleCallback,
+            @ptrCast(payload),
+        );
+
+        // sync
+        if (lock_needed) {
+            while (c.pa_operation_get_state(op) == c.PA_OPERATION_RUNNING) {
+                c.pa_threaded_mainloop_wait(self.mainloop);
+            }
+        }
+
+        if (op) |o| {
+            c.pa_operation_unref(o);
+        } else {
+            pa_log.warn("failed attempt to load module", .{});
+            payload.deinit();
+            self.allocator.destroy(payload);
+        }
+    }
+
+    fn setupInputs(self: *Self, inputs: []const Config.DeviceType) !void {
+        var defaultSet = false;
+
+        loop: for (inputs) |input| {
+            const name = blk: {
+                switch (input) {
+                    .existing => |u| {
+                        break :blk u;
+                    },
+                    .remap => |m| {
+                        try self.setupRemapModule(.source, m);
+                        break :blk m.name;
+                    },
+                    .empty => {
+                        continue :loop;
+                    },
+                }
+            };
+
+            if (defaultSet == false) {
+                try self.server.setDefaultSource(name);
+                defaultSet = true;
+            }
+        }
     }
 };

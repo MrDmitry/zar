@@ -59,6 +59,18 @@ pub const Position = enum(i8) {
     TOP_REAR_RIGHT = c.PA_CHANNEL_POSITION_TOP_REAR_RIGHT,
     TOP_REAR_CENTER = c.PA_CHANNEL_POSITION_TOP_REAR_CENTER,
     MAX = c.PA_CHANNEL_POSITION_MAX,
+
+    pub fn pulseName(self: Position) []const u8 {
+        switch (self) {
+            .FRONT_LEFT => return "front-left",
+            .FRONT_RIGHT => return "front-right",
+            .FRONT_CENTER => return "front-center",
+            .REAR_CENTER => return "rear-center",
+            .REAR_LEFT => return "rear-left",
+            .REAR_RIGHT => return "rear-right",
+            else => return "",
+        }
+    }
 };
 
 pub const Map = struct {

@@ -132,9 +132,18 @@ pub fn setDefaultSink(self: *Server, name: []const u8) !void {
     payload.data = .{
         .default_sink = try allocator.dupe(u8, name),
     };
+    errdefer allocator.destroy(payload);
 
     {
-        c.pa_threaded_mainloop_lock(self.mainloop);
+        const lock_needed = c.pa_threaded_mainloop_in_thread(self.mainloop) == 0;
+        if (lock_needed) {
+            c.pa_threaded_mainloop_lock(self.mainloop);
+        }
+        defer {
+            if (lock_needed) {
+                c.pa_threaded_mainloop_unlock(self.mainloop);
+            }
+        }
 
         pa_log.debug("set default sink to {s}", .{name});
         const op = c.pa_context_set_default_sink(
@@ -150,7 +159,42 @@ pub fn setDefaultSink(self: *Server, name: []const u8) !void {
             pa_log.warn("failed attempt to set sink", .{});
             allocator.destroy(payload);
         }
+    }
+}
 
-        c.pa_threaded_mainloop_unlock(self.mainloop);
+pub fn setDefaultSource(self: *Server, name: []const u8) !void {
+    var allocator = self.tsa.allocator();
+
+    var payload = try allocator.create(UpdatePayload);
+    payload.server = self;
+    payload.data = .{
+        .default_source = try allocator.dupe(u8, name),
+    };
+
+    {
+        const lock_needed = c.pa_threaded_mainloop_in_thread(self.mainloop) == 0;
+        if (lock_needed) {
+            c.pa_threaded_mainloop_lock(self.mainloop);
+        }
+        defer {
+            if (lock_needed) {
+                c.pa_threaded_mainloop_unlock(self.mainloop);
+            }
+        }
+
+        pa_log.debug("set default source to {s}", .{name});
+        const op = c.pa_context_set_default_source(
+            self.context,
+            name.ptr,
+            &dataUpdateCallback,
+            @ptrCast(payload),
+        );
+
+        if (op) |o| {
+            c.pa_operation_unref(o);
+        } else {
+            pa_log.warn("failed attempt to set source", .{});
+            allocator.destroy(payload);
+        }
     }
 }

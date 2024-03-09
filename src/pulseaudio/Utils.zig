@@ -52,8 +52,16 @@ pub fn Collection(T: anytype, C_PA_GET_INFO: anytype, C_PA_GET_INFO_LIST: anytyp
         }
 
         pub fn setup(self: *Self) void {
-            c.pa_threaded_mainloop_lock(self.mainloop);
-            defer c.pa_threaded_mainloop_unlock(self.mainloop);
+            const lock_needed = c.pa_threaded_mainloop_in_thread(self.mainloop) == 0;
+            if (lock_needed) {
+                c.pa_threaded_mainloop_lock(self.mainloop);
+            }
+            defer {
+                if (lock_needed) {
+                    c.pa_threaded_mainloop_unlock(self.mainloop);
+                }
+            }
+
             const op = C_PA_GET_INFO_LIST(
                 self.context,
                 &updateItemCallback,
@@ -89,16 +97,16 @@ pub fn Collection(T: anytype, C_PA_GET_INFO: anytype, C_PA_GET_INFO_LIST: anytyp
         }
 
         pub fn updateItem(self: *Self, index: u32) void {
-            if (c.pa_threaded_mainloop_in_thread(self.mainloop) == 0) {
+            const lock_needed = c.pa_threaded_mainloop_in_thread(self.mainloop) == 0;
+            if (lock_needed) {
                 c.pa_threaded_mainloop_lock(self.mainloop);
             }
             defer {
-                if (c.pa_threaded_mainloop_in_thread(self.mainloop) == 0) {
+                if (lock_needed) {
                     c.pa_threaded_mainloop_unlock(self.mainloop);
                 }
             }
 
-            std.log.debug("Utils updateItem {d}", .{index});
             const op = C_PA_GET_INFO(
                 self.context,
                 index,
@@ -111,7 +119,6 @@ pub fn Collection(T: anytype, C_PA_GET_INFO: anytype, C_PA_GET_INFO_LIST: anytyp
         pub fn removeItem(self: *Self, index: u32) void {
             self.mutex.lock();
             defer self.mutex.unlock();
-            std.log.debug("Utils removeItem {d}", .{index});
 
             if (self.collection.fetchRemove(index)) |entry| {
                 @constCast(&entry.value).deinit();

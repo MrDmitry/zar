@@ -76,9 +76,7 @@ pub fn main() !void {
 
     try pulse.start();
 
-    if (config.outputs.?.len > 0) {
-        try pulse.server.setDefaultSink(config.outputs.?[0].device.real);
-    }
+    try pulse.setup(config);
 
     var buf: [128]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);

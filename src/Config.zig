@@ -4,34 +4,32 @@ const config_filename = "config.json";
 
 const Config = @This();
 
-const DeviceType = union(enum) {
-    real: [:0]const u8,
-    virtual: [:0]const u8,
+pub const RemapDevice = struct {
+    name: [:0]const u8,
+    existing: [:0]const u8,
+    channels: struct {
+        existing: []i8,
+        remap: []i8,
+    },
+};
+
+pub const DeviceType = union(enum) {
+    existing: [:0]const u8,
+    remap: RemapDevice,
     empty,
 };
 
-const OutputEntry = struct {
-    device: DeviceType,
-};
-
-const SentinelEntry = OutputEntry{
-    .device = .empty,
-};
-
-outputs: ?[]const OutputEntry = null,
+outputs: ?[]const DeviceType = null,
+inputs: ?[]const DeviceType = null,
 
 fn default() Config {
     return Config{
-        .outputs = &[_]OutputEntry{
-            OutputEntry{
-                .device = DeviceType{
-                    .real = "alsa_output.pci-0000_2f_00.4.iec958-stereo",
-                },
+        .outputs = &[_]DeviceType{
+            DeviceType{
+                .existing = "alsa_output.pci-0000_2f_00.4.iec958-stereo",
             },
-            OutputEntry{
-                .device = DeviceType{
-                    .real = "alsa_output.usb-Allen___Heath_ZEDi10-00.analog-surround-40",
-                },
+            DeviceType{
+                .existing = "alsa_output.usb-Allen___Heath_ZEDi10-00.analog-surround-40",
             },
         },
     };
