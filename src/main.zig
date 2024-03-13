@@ -32,7 +32,29 @@ pub fn printHelp() noreturn {
     std.process.exit(1);
 }
 
+var running = std.atomic.Value(bool).init(true);
+var pulse_context: ?*PulseAudio.Context = null;
+
+fn interruptHandler(signal: c_int) align(1) callconv(.C) void {
+    std.debug.assert(signal == std.os.linux.SIG.INT);
+
+    running.store(false, .Monotonic);
+    if (pulse_context) |ctx| {
+        ctx.interrupt() catch {
+            std.log.err("FAILED TO INTERRUPT CONTEXT", .{});
+        };
+    }
+}
+
 pub fn main() !void {
+    // Process SIGINT
+    const sa = std.os.Sigaction{
+        .handler = .{ .handler = &interruptHandler },
+        .mask = std.os.empty_sigset,
+        .flags = (std.os.SA.SIGINFO | std.os.SA.RESTART),
+    };
+    try std.os.sigaction(std.os.linux.SIG.INT, &sa, null);
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer std.debug.assert(gpa.deinit() == .ok);
 
