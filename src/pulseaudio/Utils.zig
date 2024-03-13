@@ -3,6 +3,8 @@ const c = @cImport({
     @cInclude("pulse/pulseaudio.h");
 });
 
+const Queue = @import("../containers/Queue.zig");
+
 pub fn Collection(T: anytype, C_PA_GET_INFO: anytype, C_PA_GET_INFO_LIST: anytype) type {
     return struct {
         const Self = @This();
@@ -15,7 +17,7 @@ pub fn Collection(T: anytype, C_PA_GET_INFO: anytype, C_PA_GET_INFO_LIST: anytyp
             ).Pointer.child,
         ).Fn.params[1].type.?;
 
-        tsa: std.heap.ThreadSafeAllocator,
+        allocator: std.mem.Allocator,
 
         mutex: std.Thread.Mutex = .{},
 
@@ -30,9 +32,7 @@ pub fn Collection(T: anytype, C_PA_GET_INFO: anytype, C_PA_GET_INFO_LIST: anytyp
             context: *c.pa_context,
         ) Self {
             return Self{
-                .tsa = std.heap.ThreadSafeAllocator{
-                    .child_allocator = allocator,
-                },
+                .allocator = allocator,
                 .mainloop = mainloop,
                 .context = context,
                 .collection = std.AutoHashMapUnmanaged(u32, T){},
@@ -40,13 +40,11 @@ pub fn Collection(T: anytype, C_PA_GET_INFO: anytype, C_PA_GET_INFO_LIST: anytyp
         }
 
         pub fn deinit(self: *Self) void {
-            const allocator = self.tsa.allocator();
-
             var it = self.collection.valueIterator();
             while (it.next()) |v| {
                 v.deinit();
             }
-            self.collection.deinit(allocator);
+            self.collection.deinit(self.allocator);
 
             self.* = undefined;
         }
@@ -87,13 +85,12 @@ pub fn Collection(T: anytype, C_PA_GET_INFO: anytype, C_PA_GET_INFO_LIST: anytyp
             self.mutex.lock();
             defer self.mutex.unlock();
 
-            const allocator = self.tsa.allocator();
-            var entry = self.collection.getOrPut(allocator, info.*.index) catch @panic("OOM");
+            var entry = self.collection.getOrPut(self.allocator, info.*.index) catch @panic("OOM");
 
             if (entry.found_existing) {
                 entry.value_ptr.deinit();
             }
-            entry.value_ptr.* = T.init(allocator, info) catch @panic("OOM");
+            entry.value_ptr.* = T.init(self.allocator, info) catch @panic("OOM");
         }
 
         pub fn updateItem(self: *Self, index: u32) void {
@@ -123,6 +120,74 @@ pub fn Collection(T: anytype, C_PA_GET_INFO: anytype, C_PA_GET_INFO_LIST: anytyp
             if (self.collection.fetchRemove(index)) |entry| {
                 @constCast(&entry.value).deinit();
             }
+        }
+    };
+}
+
+pub fn EventQueue(T: anytype) type {
+    return struct {
+        const Self = @This();
+
+        allocator: std.mem.Allocator,
+        queue: Queue.Queue(T),
+        mutex: std.Thread.Mutex = .{},
+        cv: std.Thread.Condition = .{},
+
+        pub fn init(allocator: std.mem.Allocator) Self {
+            return Self{
+                .allocator = allocator,
+                .queue = Queue.Queue(T).init(allocator),
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.queue.deinit();
+            self.* = undefined;
+        }
+
+        pub fn toOwnedSlice(self: *Self, allocator: std.mem.Allocator) ![]T {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            std.log.warn("waiting for all", .{});
+
+            while (self.queue.empty()) {
+                self.cv.wait(&self.mutex);
+            }
+            std.log.warn("popping all", .{});
+
+            var result = try allocator.alloc(T, self.queue.len);
+            for (0..self.queue.len) |i| {
+                result[i] = self.queue.pop().?;
+            }
+
+            return result;
+        }
+
+        pub fn push(self: *Self, item: T) !void {
+            std.log.warn("waiting to push {}", .{item});
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            std.log.warn("pushing {}", .{item});
+
+            try self.queue.push(item);
+
+            self.cv.signal();
+        }
+
+        pub fn pop(self: *Self) ?T {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            std.log.warn("waiting", .{});
+
+            while (self.queue.empty()) {
+                self.cv.wait(&self.mutex);
+            }
+
+            std.log.warn("popping", .{});
+
+            return self.queue.pop();
         }
     };
 }

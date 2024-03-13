@@ -10,6 +10,7 @@ const Sink = @import("Sink.zig");
 const SinkInput = @import("SinkInput.zig");
 const Source = @import("Source.zig");
 const SourceOutput = @import("SourceOutput.zig");
+const Utils = @import("Utils.zig");
 
 const PulseError = error{
     GeneralError,
@@ -81,6 +82,12 @@ const LoadModulePayload = struct {
     }
 };
 
+const EventPayload = struct {
+    facility: EventFacility,
+    type: EventType,
+    id: u32,
+};
+
 pub const Context = struct {
     const Self = @This();
 
@@ -99,6 +106,8 @@ pub const Context = struct {
     mutex: std.Thread.Mutex = .{},
     cv: std.Thread.Condition = .{},
     ready: bool = false,
+
+    events: Utils.EventQueue(EventPayload),
 
     pub fn init(allocator: std.mem.Allocator) Self {
         const mainloop = c.pa_threaded_mainloop_new().?;
@@ -124,10 +133,13 @@ pub const Context = struct {
             .sink_input = SinkInput.init(allocator, mainloop, ctx),
             .source = Source.init(allocator, mainloop, ctx),
             .source_output = SourceOutput.init(allocator, mainloop, ctx),
+            .events = Utils.EventQueue(EventPayload).init(allocator),
         };
     }
 
     pub fn deinit(self: *Self) void {
+        self.events.deinit();
+
         self.source_output.deinit();
         self.source.deinit();
         self.sink_input.deinit();
@@ -147,77 +159,21 @@ pub const Context = struct {
         c.pa_threaded_mainloop_signal(self.mainloop, 0);
     }
 
-    fn eventSubscribeCallback(ctx: ?*c.pa_context, event_type: c.pa_subscription_event_type_t, id: u32, data: ?*anyopaque) callconv(.C) void {
+    fn eventCallback(ctx: ?*c.pa_context, event_type: c.pa_subscription_event_type_t, id: u32, data: ?*anyopaque) callconv(.C) void {
         const self: *Self = @ptrCast(@alignCast(data.?));
         std.debug.assert(ctx.? == self.context);
         const event = Event.init(event_type);
-        pa_log.debug("{} event[{d}] {any}", .{ std.time.timestamp(), id, event });
-        switch (event.facility) {
-            EventFacility.SINK => {
-                switch (event.type) {
-                    EventType.REMOVE => {
-                        self.sink.collection.removeItem(id);
-                    },
-                    EventType.NEW, EventType.CHANGE => {
-                        self.sink.collection.updateItem(id);
-                    },
-                    EventType.INVALID => unreachable,
-                }
-            },
-            EventFacility.SOURCE => {
-                switch (event.type) {
-                    EventType.REMOVE => {
-                        self.source.collection.removeItem(id);
-                    },
-                    EventType.NEW, EventType.CHANGE => {
-                        self.source.collection.updateItem(id);
-                    },
-                    EventType.INVALID => unreachable,
-                }
-            },
-            EventFacility.SINK_INPUT => {
-                switch (event.type) {
-                    EventType.REMOVE => {
-                        self.sink_input.collection.removeItem(id);
-                    },
-                    EventType.NEW, EventType.CHANGE => {
-                        self.sink_input.collection.updateItem(id);
-                    },
-                    EventType.INVALID => unreachable,
-                }
-            },
-            EventFacility.SOURCE_OUTPUT => {
-                switch (event.type) {
-                    EventType.REMOVE => {
-                        self.source_output.collection.removeItem(id);
-                    },
-                    EventType.NEW, EventType.CHANGE => {
-                        self.source_output.collection.updateItem(id);
-                    },
-                    EventType.INVALID => unreachable,
-                }
-            },
-            EventFacility.MODULE => {},
-            EventFacility.CLIENT => {
-                switch (event.type) {
-                    EventType.REMOVE => {
-                        self.client.collection.removeItem(id);
-                    },
-                    EventType.NEW, EventType.CHANGE => {
-                        self.client.collection.updateItem(id);
-                    },
-                    EventType.INVALID => unreachable,
-                }
-            },
-            EventFacility.SAMPLE_CACHE => {},
-            EventFacility.SERVER => {},
-            EventFacility.AUTOLOAD => {},
-            EventFacility.CARD => {},
-            else => {},
-        }
+        const payload = EventPayload{
+            .facility = event.facility,
+            .type = event.type,
+            .id = id,
+        };
+        self.events.push(payload) catch {
+            pa_log.err("{} failed to push event {} to queue", .{ std.time.timestamp(), payload });
+        };
     }
 
-    fn eventCallback(ctx: ?*c.pa_context, flag: c_int, data: ?*anyopaque) callconv(.C) void {
+    fn eventSubscribeCallback(ctx: ?*c.pa_context, flag: c_int, data: ?*anyopaque) callconv(.C) void {
         const self: *Self = @ptrCast(@alignCast(data.?));
         std.debug.assert(ctx.? == self.context);
         pa_log.debug("event callback: {d}", .{flag});
@@ -239,7 +195,7 @@ pub const Context = struct {
 
                 c.pa_context_set_subscribe_callback(
                     self.context,
-                    &eventSubscribeCallback,
+                    &eventCallback,
                     @ptrCast(self),
                 );
 
@@ -303,7 +259,7 @@ pub const Context = struct {
             const op = c.pa_context_subscribe(
                 self.context,
                 c.PA_SUBSCRIPTION_MASK_ALL,
-                &eventCallback,
+                &eventSubscribeCallback,
                 @ptrCast(self),
             );
 
@@ -321,6 +277,84 @@ pub const Context = struct {
         self.sink_input.collection.setup();
         self.source.collection.setup();
         self.source_output.collection.setup();
+    }
+
+    pub fn interrupt(self: *Self) !void {
+        self.events.cv.signal();
+    }
+
+    pub fn update(self: *Self) !void {
+        pa_log.warn("waiting for events", .{});
+
+        const events = try self.events.toOwnedSlice(self.allocator);
+        defer self.allocator.free(events);
+
+        pa_log.warn("found {} events", .{events.len});
+
+        for (events) |event| {
+            switch (event.facility) {
+                EventFacility.SINK => {
+                    switch (event.type) {
+                        EventType.REMOVE => {
+                            self.sink.collection.removeItem(event.id);
+                        },
+                        EventType.NEW, EventType.CHANGE => {
+                            self.sink.collection.updateItem(event.id);
+                        },
+                        EventType.INVALID => unreachable,
+                    }
+                },
+                EventFacility.SOURCE => {
+                    switch (event.type) {
+                        EventType.REMOVE => {
+                            self.source.collection.removeItem(event.id);
+                        },
+                        EventType.NEW, EventType.CHANGE => {
+                            self.source.collection.updateItem(event.id);
+                        },
+                        EventType.INVALID => unreachable,
+                    }
+                },
+                EventFacility.SINK_INPUT => {
+                    switch (event.type) {
+                        EventType.REMOVE => {
+                            self.sink_input.collection.removeItem(event.id);
+                        },
+                        EventType.NEW, EventType.CHANGE => {
+                            self.sink_input.collection.updateItem(event.id);
+                        },
+                        EventType.INVALID => unreachable,
+                    }
+                },
+                EventFacility.SOURCE_OUTPUT => {
+                    switch (event.type) {
+                        EventType.REMOVE => {
+                            self.source_output.collection.removeItem(event.id);
+                        },
+                        EventType.NEW, EventType.CHANGE => {
+                            self.source_output.collection.updateItem(event.id);
+                        },
+                        EventType.INVALID => unreachable,
+                    }
+                },
+                EventFacility.MODULE => {},
+                EventFacility.CLIENT => {
+                    switch (event.type) {
+                        EventType.REMOVE => {
+                            self.client.collection.removeItem(event.id);
+                        },
+                        EventType.NEW, EventType.CHANGE => {
+                            self.client.collection.updateItem(event.id);
+                        },
+                        EventType.INVALID => unreachable,
+                    }
+                },
+                EventFacility.INVALID => {
+                    return;
+                },
+                else => {},
+            }
+        }
     }
 
     pub fn stop(self: *Self) void {

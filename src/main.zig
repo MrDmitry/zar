@@ -74,14 +74,15 @@ pub fn main() !void {
     var pulse = PulseAudio.Context.init(gpa.allocator());
     defer pulse.deinit();
 
+    pulse_context = &pulse;
+
     try pulse.start();
 
     try pulse.setup(config);
 
-    var buf: [128]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    _ = try std.io.getStdIn().reader().streamUntilDelimiter(fbs.writer(), '\n', null);
-    std.log.debug("input: {s}", .{buf});
+    while (running.load(.Monotonic)) {
+        try pulse.update();
+    }
 
     pulse.stop();
 }
