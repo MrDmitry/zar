@@ -2,6 +2,7 @@ const std = @import("std");
 const c = @cImport({
     @cInclude("pulse/pulseaudio.h");
 });
+const StopSource = @import("../async/StopSource.zig");
 const Channel = @import("Channel.zig");
 const Client = @import("Client.zig");
 const Config = @import("../Config.zig");
@@ -92,6 +93,7 @@ pub const Context = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
+    stop_src: *StopSource,
 
     mainloop: *c.pa_threaded_mainloop,
     mainloop_api: *c.pa_mainloop_api,
@@ -109,9 +111,9 @@ pub const Context = struct {
 
     events: Utils.EventQueue(EventPayload),
 
-    pub fn init(allocator: std.mem.Allocator) Self {
+    pub fn init(allocator: std.mem.Allocator, stop_src: *StopSource) Self {
         const mainloop = c.pa_threaded_mainloop_new().?;
-        errdefer c.pa_threaded_mainloop_new(mainloop);
+        errdefer c.pa_threaded_mainloop_free(mainloop);
 
         c.pa_threaded_mainloop_set_name(mainloop, "zar_pa");
 
@@ -124,6 +126,7 @@ pub const Context = struct {
 
         return Self{
             .allocator = allocator,
+            .stop_src = stop_src.spawnChild(allocator) catch @panic("OOM"),
             .mainloop = mainloop,
             .mainloop_api = api,
             .context = ctx,
@@ -151,6 +154,8 @@ pub const Context = struct {
         c.pa_context_unref(self.context);
         c.pa_threaded_mainloop_stop(self.mainloop);
         c.pa_threaded_mainloop_free(self.mainloop);
+
+        self.stop_src.deinit();
     }
 
     fn initServer(_: ?*c.pa_context, info: [*c]const c.pa_server_info, data: ?*anyopaque) callconv(.C) void {
@@ -279,14 +284,10 @@ pub const Context = struct {
         self.source_output.collection.setup();
     }
 
-    pub fn interrupt(self: *Self) !void {
-        self.events.cv.signal();
-    }
-
     pub fn update(self: *Self) !void {
         pa_log.warn("waiting for events", .{});
 
-        const events = try self.events.toOwnedSlice(self.allocator);
+        const events = try self.events.toOwnedSlice(self.allocator, self.stop_src.getToken());
         defer self.allocator.free(events);
 
         pa_log.warn("found {} events", .{events.len});

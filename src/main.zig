@@ -1,4 +1,5 @@
 const std = @import("std");
+const StopSource = @import("async/StopSource.zig");
 const PulseAudio = @import("pulseaudio/Context.zig");
 const Config = @import("Config.zig");
 
@@ -32,21 +33,22 @@ pub fn printHelp() noreturn {
     std.process.exit(1);
 }
 
-var running = std.atomic.Value(bool).init(true);
+var stop_src: *StopSource = undefined;
 var pulse_context: ?*PulseAudio.Context = null;
 
 fn interruptHandler(signal: c_int) align(1) callconv(.C) void {
     std.debug.assert(signal == std.os.linux.SIG.INT);
 
-    running.store(false, .Monotonic);
-    if (pulse_context) |ctx| {
-        ctx.interrupt() catch {
-            std.log.err("FAILED TO INTERRUPT CONTEXT", .{});
-        };
-    }
+    stop_src.requestStop();
 }
 
 pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(gpa.deinit() == .ok);
+
+    stop_src = try StopSource.init(gpa.allocator());
+    defer stop_src.deinit();
+
     // Process SIGINT
     const sa = std.os.Sigaction{
         .handler = .{ .handler = &interruptHandler },
@@ -54,9 +56,6 @@ pub fn main() !void {
         .flags = (std.os.SA.SIGINFO | std.os.SA.RESTART),
     };
     try std.os.sigaction(std.os.linux.SIG.INT, &sa, null);
-
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(gpa.deinit() == .ok);
 
     var args = try std.process.ArgIterator.initWithAllocator(gpa.allocator());
     defer args.deinit();
@@ -93,7 +92,7 @@ pub fn main() !void {
     //try config.write(config_dir.?);
     std.log.debug("config: {any}", .{config});
 
-    var pulse = PulseAudio.Context.init(gpa.allocator());
+    var pulse = PulseAudio.Context.init(gpa.allocator(), stop_src);
     defer pulse.deinit();
 
     pulse_context = &pulse;
@@ -102,7 +101,7 @@ pub fn main() !void {
 
     try pulse.setup(config);
 
-    while (running.load(.Monotonic)) {
+    while (!stop_src.stopRequested()) {
         try pulse.update();
     }
 

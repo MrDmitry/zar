@@ -3,6 +3,7 @@ const c = @cImport({
     @cInclude("pulse/pulseaudio.h");
 });
 
+const StopToken = @import("../async/StopSource.zig").StopToken;
 const Queue = @import("../containers/Queue.zig");
 
 pub fn Collection(T: anytype, C_PA_GET_INFO: anytype, C_PA_GET_INFO_LIST: anytype) type {
@@ -145,13 +146,17 @@ pub fn EventQueue(T: anytype) type {
             self.* = undefined;
         }
 
-        pub fn toOwnedSlice(self: *Self, allocator: std.mem.Allocator) ![]T {
+        pub fn toOwnedSlice(self: *Self, allocator: std.mem.Allocator, stop_token: StopToken) ![]T {
             self.mutex.lock();
             defer self.mutex.unlock();
             std.log.warn("waiting for all", .{});
 
             while (self.queue.empty()) {
-                self.cv.wait(&self.mutex);
+                self.cv.timedWait(&self.mutex, std.time.ns_per_s / 2) catch {
+                    if (stop_token.stopRequested()) {
+                        return try allocator.alloc(T, 0);
+                    }
+                };
             }
             std.log.warn("popping all", .{});
 
